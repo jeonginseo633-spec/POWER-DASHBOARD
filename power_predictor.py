@@ -1,13 +1,17 @@
-"""PDF 기반 전력 예측. 실행 예시는 사용방법.md를 참고하세요."""
+import streamlit as st
 from pathlib import Path
-import argparse, json
+import json
 import numpy as np
 import pandas as pd
 import joblib
 from sklearn.ensemble import ExtraTreesRegressor
-BASE = Path(__file__).resolve().parent
 
+# 페이지 기본 설정
+st.set_page_config(page_title="전력 예측 대시보드", page_icon="⚡", layout="wide")
+
+BASE = Path(__file__).resolve().parent
 COLS=['생산량','기온','풍속','습도','강수량','전기요금(계절)','공장인원','인건비']
+
 def features(df):
     dt=df.datetime; h=dt.dt.hour.astype(float); dow=dt.dt.dayofweek.astype(float); doy=dt.dt.dayofyear.astype(float)
     q=df['생산량'].fillna(0);t=df['기온'].interpolate(limit_direction='both');wind=df['풍속'].interpolate(limit_direction='both');hum=df['습도'].interpolate(limit_direction='both');rain=df['강수량'].fillna(0);workers=df['공장인원'].fillna(0);work=(workers>0).astype(float);heat=np.maximum(18-t,0);cool=np.maximum(t-22,0)
@@ -25,24 +29,19 @@ def features(df):
     x['shutdown_week']=((x.rows_in_week==168)&(x.prod_week_sum==0)&(x.workers_week_sum==0)).astype(float)
     x['is_weekend']=(dow>=5).astype(float);x['slot']=dow*24+h;x['log1p_production']=np.log1p(np.maximum(q,0));x['sqrt_production']=np.sqrt(np.maximum(q,0));x['temp_work']=t*work
     return x.astype(float)
+
 def metric(y,p):
     y=np.asarray(y);p=np.asarray(p);e=p-y;nz=abs(y)>1e-9
     return dict(n=len(y),mae=float(abs(e).mean()),rmse=float(np.sqrt((e*e).mean())),r2=float(1-(e*e).sum()/((y-y.mean())**2).sum()),mape=float(np.mean(abs(e[nz]/y[nz]))*100))
 
 class PowerPredictor:
-    """웹 계산기와 같은 학습 설정 및 과거 패턴 가정을 사용합니다."""
     def fit(self, csv_path):
         d = pd.read_csv(csv_path)
-        if not d.groupby('날짜', sort=False).size().eq(24).all():
-            raise ValueError('시간 복원을 위해 날짜별 24행이 필요합니다.')
         h = d.groupby('날짜', sort=False).cumcount()
-        if not ((d['시간'] == h) | ~d['시간'].between(0,23)).all():
-            raise ValueError('시간과 행 순서가 일치하지 않습니다.')
         d['datetime'] = pd.to_datetime(d['날짜'].astype(str)) + pd.to_timedelta(h, unit='h')
         d = d.sort_values('datetime').reset_index(drop=True)
         train, test = d[d.datetime < '2021-07-01'].copy(), d[d.datetime >= '2021-07-01'].copy()
-        self.model = ExtraTreesRegressor(n_estimators=500, min_samples_leaf=2,
-                                        max_features=.75, random_state=42, n_jobs=-1)
+        self.model = ExtraTreesRegressor(n_estimators=500, min_samples_leaf=2, max_features=.75, random_state=42, n_jobs=-1)
         self.model.fit(features(train), train['평균'])
         quiet = train[(train['생산량'].fillna(0)==0) & (train['공장인원'].fillna(0)==0)]
         self.standby = quiet.groupby(quiet.datetime.dt.hour)['평균'].median().reindex(range(24)).fillna(quiet['평균'].median()).to_numpy()
@@ -56,21 +55,10 @@ class PowerPredictor:
         mask = x.shutdown_week.eq(1).to_numpy()
         pred[mask] = self.standby[test.datetime.dt.hour.to_numpy()[mask]]
         self.metrics = metric(test['평균'], pred)
-        test = test[['datetime','평균']].copy()
-        test['prediction'] = pred
         return test
 
-    def predict_day(self, date, hour=11, production=None, temperature=None,
-                    workers=None, weekday=None, shutdown=False, rate=None):
-        """선택 시간 입력을 반영해 24시간을 재계산합니다. weekday: 월=1~일=7."""
+    def predict_day(self, date, hour=11, production=None, temperature=None, workers=None, weekday=None, shutdown=False, rate=None):
         target = pd.Timestamp(date).normalize()
-        if not isinstance(hour, int) or not 0 <= hour <= 23:
-            raise ValueError('시간은 0~23 정수입니다.')
-        if weekday is not None and (weekday not in range(1,8)):
-            raise ValueError('요일은 월=1~일=7입니다.')
-        for name, value in [('production', production),('temperature', temperature),('workers',workers),('rate',rate)]:
-            if value is not None and (not np.isfinite(value) or (name != 'temperature' and value < 0)):
-                raise ValueError('입력값 범위를 확인하세요.')
         start = target - pd.Timedelta(days=target.dayofweek)
         dates = pd.date_range(start, periods=168, freq='h')
         shift = 0 if weekday is None else weekday-1-target.dayofweek
@@ -83,7 +71,6 @@ class PowerPredictor:
             if value is not None: d.loc[selected,col] = value
         if shutdown: d[['생산량','공장인원']] = 0
         x = features(d)
-        # 요일 시나리오만 변경하고 실제 날짜의 월·연중 일수는 유지합니다.
         slot = dow*24+dates.hour
         x['dow']=dow; x['slot']=slot; x['is_weekend']=(dow>=5).astype(float)
         x['sin_week']=np.sin(2*np.pi*slot/168); x['cos_week']=np.cos(2*np.pi*slot/168)
@@ -92,39 +79,61 @@ class PowerPredictor:
         pred[mask]=self.standby[dates.hour[mask]]
         out=d.loc[dates.normalize()==target,['datetime','생산량','기온','공장인원']].copy()
         out['predicted_kW']=pred[dates.normalize()==target]
-        out['energy_kWh']=out.predicted_kW  # 각 행은 1시간의 평균 전력
+        out['energy_kWh']=out.predicted_kW 
         if rate is not None: out['usage_cost_won']=out.energy_kWh*rate
         return out.reset_index(drop=True)
 
-def main():
-    parser=argparse.ArgumentParser(description='전력 예측: 학습 또는 날짜별 계산')
-    parser.add_argument('--train',action='store_true')
-    parser.add_argument('--csv',type=Path,default=BASE/'okm_augumented_2021.csv')
-    parser.add_argument('--model',type=Path,default=BASE/'power_model.joblib')
-    parser.add_argument('--date',default='2026-12-28')
-    parser.add_argument('--hour',type=int,default=11)
-    parser.add_argument('--production',type=float)
-    parser.add_argument('--temperature',type=float)
-    parser.add_argument('--workers',type=float)
-    parser.add_argument('--weekday',type=int)
-    parser.add_argument('--shutdown',action='store_true')
-    parser.add_argument('--rate',type=float)
-    args=parser.parse_args()
-    if args.train or not args.model.exists():
-        predictor=PowerPredictor()
-        validation=predictor.fit(args.csv)
-        # 사전만 저장하여 스크립트 실행/모듈 import 양쪽에서 로드할 수 있게 합니다.
-        joblib.dump(predictor.__dict__,args.model,compress=3)
-        validation.to_csv(BASE/'validation.csv',index=False,encoding='utf-8-sig')
-        (BASE/'metrics.json').write_text(json.dumps(predictor.metrics,indent=2),encoding='utf8')
+# 모델 불러오기 및 캐싱 (로딩 속도 최적화)
+@st.cache_resource
+def load_model():
+    predictor = PowerPredictor()
+    csv_path = BASE / 'okm_augumented_2021.csv'
+    model_path = BASE / 'power_model.joblib'
+    
+    if model_path.exists():
+        predictor.__dict__.update(joblib.load(model_path))
     else:
-        predictor=PowerPredictor()
-        predictor.__dict__.update(joblib.load(args.model))
-    out=predictor.predict_day(args.date,args.hour,args.production,args.temperature,args.workers,args.weekday,args.shutdown,args.rate)
-    out.to_csv(BASE/'prediction.csv',index=False,encoding='utf-8-sig')
-    print(out.to_string(index=False))
-    print('Daily energy (kWh):',round(out.energy_kWh.sum(),2))
-    print('Conditional estimate. Oct-Dec accuracy is unverified; missing inputs use Jan-Jun profiles.')
+        with st.spinner('최초 모델 학습 중입니다. 잠시만 기다려주세요... (약 1~2분 소요)'):
+            predictor.fit(csv_path)
+            joblib.dump(predictor.__dict__, model_path, compress=3)
+    return predictor
 
-if __name__=='__main__':
-    main()
+# 화면 구성
+st.title("⚡ AI 기반 전력 예측 대시보드")
+st.markdown("과거 패턴을 분석하여 설정된 조건에 따른 24시간 전력 사용량을 예측합니다.")
+
+try:
+    predictor = load_model()
+    
+    # 사이드바 입력 설정
+    st.sidebar.header("⚙️ 예측 조건 설정")
+    in_date = st.sidebar.date_input("날짜 선택", pd.to_datetime('2026-12-28'))
+    in_hour = st.sidebar.slider("시간 선택", 0, 23, 11)
+    in_prod = st.sidebar.number_input("예상 생산량", value=100.0)
+    in_temp = st.sidebar.number_input("예상 기온 (℃)", value=20.0)
+    in_work = st.sidebar.number_input("예상 공장인원", value=50.0)
+    
+    if st.sidebar.button("결과 예측하기", type="primary"):
+        with st.spinner("데이터 예측 중..."):
+            result = predictor.predict_day(
+                date=str(in_date), 
+                hour=in_hour, 
+                production=in_prod, 
+                temperature=in_temp, 
+                workers=in_work
+            )
+            
+            total_energy = round(result.energy_kWh.sum(), 2)
+            
+            st.success("예측이 완료되었습니다!")
+            st.metric(label="일일 총 예상 전력량", value=f"{total_energy:,} kWh")
+            
+            st.subheader("📈 시간대별 전력 예측 그래프")
+            chart_data = result.set_index('datetime')[['predicted_kW']]
+            st.line_chart(chart_data)
+            
+            st.subheader("📋 상세 데이터")
+            st.dataframe(result, use_container_width=True)
+
+except Exception as e:
+    st.error(f"데이터를 불러오는 중 문제가 발생했습니다. (에러: {e}) csv 파일이 깃허브에 있는지 확인해주세요.")
